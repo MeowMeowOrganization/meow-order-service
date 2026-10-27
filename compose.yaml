@@ -1,0 +1,19 @@
+name: meow-order-service-dev
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meow
+      POSTGRES_PASSWORD: meow
+      POSTGRES_DB: meow_order_service
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - order_service_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meow -d meow_order_service"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+volumes:
+  order_service_pgdata:
