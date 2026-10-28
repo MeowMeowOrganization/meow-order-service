@@ -14,13 +14,22 @@ import (
 
 // Config contains validated process configuration. DatabaseURL must never be logged.
 type Config struct {
-	HTTPAddr         string
-	DatabaseURL      string
-	DatabaseMaxConns int32
-	LogLevel         slog.Level
-	StartupTimeout   time.Duration
-	ReadinessTimeout time.Duration
-	ShutdownTimeout  time.Duration
+	HTTPAddr             string
+	DatabaseURL          string
+	DatabaseMaxConns     int32
+	LogLevel             slog.Level
+	StartupTimeout       time.Duration
+	ReadinessTimeout     time.Duration
+	ShutdownTimeout      time.Duration
+	OutboxEnabled        bool
+	KafkaBrokers         []string
+	MatchingTopic        string
+	OutboxBatchSize      int
+	OutboxPollInterval   time.Duration
+	OutboxLeaseTTL       time.Duration
+	OutboxPublishTimeout time.Duration
+	OutboxRetryBase      time.Duration
+	OutboxRetryMax       time.Duration
 }
 
 // Load obtains configuration exclusively from the environment.
@@ -73,6 +82,53 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 		}
 		*field.output = parsed
 	}
+	enabled, err := strconv.ParseBool(get("ORDER_SERVICE_OUTBOX_ENABLED", "false"))
+	if err != nil {
+		return Config{}, errors.New("ORDER_SERVICE_OUTBOX_ENABLED must be true or false")
+	}
+	cfg.OutboxEnabled = enabled
+	cfg.MatchingTopic = get("ORDER_SERVICE_MATCHING_TOPIC", "matching.commands.v1")
+	cfg.OutboxBatchSize, err = strconv.Atoi(get("ORDER_SERVICE_OUTBOX_BATCH_SIZE", "8"))
+	if err != nil || cfg.OutboxBatchSize < 1 || cfg.OutboxBatchSize > 100 {
+		return Config{}, errors.New("ORDER_SERVICE_OUTBOX_BATCH_SIZE must be 1..100")
+	}
+	outboxDurations := []struct {
+		key      string
+		dest     *time.Duration
+		fallback string
+	}{
+		{"ORDER_SERVICE_OUTBOX_POLL_INTERVAL", &cfg.OutboxPollInterval, "250ms"},
+		{"ORDER_SERVICE_OUTBOX_LEASE_TTL", &cfg.OutboxLeaseTTL, "45s"},
+		{"ORDER_SERVICE_OUTBOX_PUBLISH_TIMEOUT", &cfg.OutboxPublishTimeout, "5s"},
+		{"ORDER_SERVICE_OUTBOX_RETRY_BASE", &cfg.OutboxRetryBase, "500ms"},
+		{"ORDER_SERVICE_OUTBOX_RETRY_MAX", &cfg.OutboxRetryMax, "30s"},
+	}
+	for _, d := range outboxDurations {
+		v, parseErr := time.ParseDuration(get(d.key, d.fallback))
+		if parseErr != nil || v < time.Millisecond || v > 5*time.Minute || v%time.Millisecond != 0 {
+			return Config{}, fmt.Errorf("%s must be 1ms..5m in whole milliseconds", d.key)
+		}
+		*d.dest = v
+	}
+	if cfg.OutboxLeaseTTL <= cfg.OutboxPublishTimeout+time.Second ||
+		cfg.OutboxRetryMax < cfg.OutboxRetryBase || cfg.OutboxPollInterval < 10*time.Millisecond ||
+		cfg.OutboxPublishTimeout > time.Minute {
+		return Config{}, errors.New("invalid outbox lease/timeout/retry relationship")
+	}
+	if enabled {
+		brokers := get("ORDER_SERVICE_KAFKA_BROKERS", "")
+		for _, broker := range strings.Split(brokers, ",") {
+			host, port, splitErr := net.SplitHostPort(broker)
+			n, portErr := strconv.Atoi(port)
+			if splitErr != nil || strings.TrimSpace(broker) != broker || host == "" || portErr != nil || n < 1 || n > 65535 {
+				return Config{}, errors.New("ORDER_SERVICE_KAFKA_BROKERS must be comma-separated host:port entries when outbox is enabled")
+			}
+			cfg.KafkaBrokers = append(cfg.KafkaBrokers, broker)
+		}
+		if !validKafkaTopic(cfg.MatchingTopic) {
+			return Config{}, errors.New("ORDER_SERVICE_MATCHING_TOPIC must be a valid Kafka topic")
+		}
+	}
 	if err := validateListenAddr(cfg.HTTPAddr); err != nil {
 		return Config{}, err
 	}
@@ -104,4 +160,16 @@ func validateDatabaseURL(dsn string) error {
 		return errors.New("ORDER_SERVICE_DATABASE_URL cannot contain a fragment")
 	}
 	return nil
+}
+
+func validKafkaTopic(topic string) bool {
+	if len(topic) == 0 || len(topic) > 128 || topic == "." || topic == ".." {
+		return false
+	}
+	for _, ch := range []byte(topic) {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '.' || ch == '-' || ch == '_') {
+			return false
+		}
+	}
+	return true
 }

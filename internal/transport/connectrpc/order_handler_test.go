@@ -34,3 +34,11 @@ func TestOrderRouteDoesNotRegisterPublicGatewayRPC(t *testing.T) {
 		t.Fatalf("unexpected gateway route: status=%d", rec.Code)
 	}
 }
+
+// Matches the package declared in meow-contracts private/order/v1alpha1.
+func TestOrderProcedureUsesPrivateContractNamespace(t *testing.T) {
+	const want = "/meow.exchange.private.order.v1alpha1.OrderService/SubmitLimitOrder"
+	if SubmitLimitOrderProcedure != want {
+		t.Fatalf("RPC procedure mismatch: got %q, want %q", SubmitLimitOrderProcedure, want)
+	}
+}
