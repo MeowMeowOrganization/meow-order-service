@@ -9,16 +9,19 @@ import (
 	"net/http"
 	"time"
 
+	cancelapp "github.com/MeowMeowOrganization/meow-order-service/internal/application/cancel"
+	queryapp "github.com/MeowMeowOrganization/meow-order-service/internal/application/privatequery"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/config"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/infrastructure/httpserver"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/infrastructure/kafka"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/infrastructure/postgres"
 	rpc "github.com/MeowMeowOrganization/meow-order-service/internal/transport/connectrpc"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/transport/health"
+	"github.com/MeowMeowOrganization/meow-order-service/internal/worker/lifecycle"
 	"github.com/MeowMeowOrganization/meow-order-service/internal/worker/outbox"
 )
 
-// Run is the composition root: no package besides bootstrap constructs all dependencies.
+// Run is the composition root: no other package constructs all dependencies.
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	startupCtx, cancel := context.WithTimeout(ctx, cfg.StartupTimeout)
 	pool, err := postgres.Open(startupCtx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
@@ -32,60 +35,144 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", healthHandler.Live)
 	mux.HandleFunc("/readyz", healthHandler.Ready)
-	rpc.Register(mux, rpc.OrderHandler{})
+	// The CancelOrder RPC is opt-in only when BOTH publication and
+	// result-consumption workers are enabled. Never accept new commands when
+	// this process cannot reconcile their committed matcher outcomes.
+	var orderHandler rpc.OrderHandler
+	if cfg.OutboxEnabled && cfg.LifecycleEnabled {
+		cancelRepo, err := postgres.NewCancelRepository(pool)
+		if err != nil {
+			return err
+		}
+		cancelService, err := cancelapp.New(cancelRepo)
+		if err != nil {
+			return err
+		}
+		orderHandler = rpc.NewOrderHandler(cancelService)
+	}
+	queryRepo, err := postgres.NewPrivateQueryRepository(pool)
+	if err != nil {
+		return err
+	}
+	queryService, err := queryapp.New(queryRepo)
+	if err != nil {
+		return err
+	}
+	orderHandler = orderHandler.WithPrivateQueries(queryService)
+	rpc.Register(mux, orderHandler)
 	srv := httpserver.New(cfg.HTTPAddr, mux, logger)
 	listener, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("bind HTTP listener: %w", err)
 	}
 
-	// Start the publication loop only when explicitly enabled. The default
-	// Docker dev environment contains PostgreSQL but no Kafka broker.
-	if !cfg.OutboxEnabled {
-		return serve(ctx, listener, srv, healthHandler, cfg.ShutdownTimeout, logger)
-	}
-	repository, err := postgres.NewOutboxRepository(pool)
-	if err != nil {
-		_ = listener.Close()
-		return err
-	}
-	producer, err := kafka.NewPublisher(cfg.KafkaBrokers, cfg.MatchingTopic)
-	if err != nil {
-		_ = listener.Close()
-		return err
-	}
-	defer func() {
-		if err := producer.Close(); err != nil {
-			logger.Warn("Kafka producer close failed", "error", err)
+	var tasks []backgroundTask
+	if cfg.OutboxEnabled {
+		repository, err := postgres.NewOutboxRepository(pool)
+		if err != nil {
+			_ = listener.Close()
+			return err
 		}
-	}()
-	worker, err := outbox.New(repository, producer, logger, outbox.Options{
-		BatchSize: cfg.OutboxBatchSize, PollInterval: cfg.OutboxPollInterval,
-		LeaseTTL: cfg.OutboxLeaseTTL, PublishTimeout: cfg.OutboxPublishTimeout,
-		RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax,
-	})
-	if err != nil {
-		_ = listener.Close()
-		return err
-	}
-	workerCtx, stopWorker := context.WithCancel(ctx)
-	workerDone := make(chan error, 1)
-	go func() { workerDone <- worker.Run(workerCtx) }()
-	logger.Info("matching outbox worker started", "topic", cfg.MatchingTopic)
-	serveErr := serve(ctx, listener, srv, healthHandler, cfg.ShutdownTimeout, logger)
-	stopWorker()
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer drainCancel()
-	select {
-	case workerErr := <-workerDone:
-		if workerErr != nil {
-			return errors.Join(serveErr, workerErr)
+		producer, err := kafka.NewPublisher(cfg.KafkaBrokers, cfg.MatchingTopic)
+		if err != nil {
+			_ = listener.Close()
+			return err
 		}
-	case <-drainCtx.Done():
-		return errors.Join(serveErr, errors.New("outbox worker did not stop within shutdown timeout"))
+		defer func() {
+			if err := producer.Close(); err != nil {
+				logger.Warn("Kafka producer close failed", "error", err)
+			}
+		}()
+		worker, err := outbox.New(repository, producer, logger, outbox.Options{
+			BatchSize: cfg.OutboxBatchSize, PollInterval: cfg.OutboxPollInterval,
+			LeaseTTL: cfg.OutboxLeaseTTL, PublishTimeout: cfg.OutboxPublishTimeout,
+			RetryBase: cfg.OutboxRetryBase, RetryMax: cfg.OutboxRetryMax,
+		})
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		tasks = append(tasks, backgroundTask{name: "matching outbox", run: worker.Run})
+		logger.Info("matching outbox configured", "topic", cfg.MatchingTopic)
 	}
-	logger.Info("matching outbox worker stopped")
-	return serveErr
+	if cfg.LifecycleEnabled {
+		repository, err := postgres.NewLifecycleRepository(pool)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		consumer, err := kafka.NewLifecycleConsumer(cfg.KafkaBrokers, cfg.ResultsTopic, cfg.LifecycleGroupID)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		defer func() {
+			if err := consumer.Close(); err != nil {
+				logger.Warn("Kafka lifecycle consumer close failed", "error", err)
+			}
+		}()
+		worker, err := lifecycle.New(consumer, repository, logger, cfg.ResultsTopic, lifecycle.Options{
+			ApplyTimeout: cfg.LifecycleApplyTimeout, CommitTimeout: cfg.LifecycleCommitTimeout,
+			RetryBase: cfg.LifecycleRetryBase, RetryMax: cfg.LifecycleRetryMax,
+		})
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		tasks = append(tasks, backgroundTask{name: "Kafka matching-result consumer", run: worker.Run})
+		logger.Info("Kafka lifecycle consumer configured", "topic", cfg.ResultsTopic, "group", cfg.LifecycleGroupID)
+	}
+	return runManaged(ctx, listener, srv, healthHandler, cfg.ShutdownTimeout, logger, tasks)
+}
+
+type backgroundTask struct {
+	name string
+	run  func(context.Context) error
+}
+type processExit struct {
+	name string
+	err  error
+}
+
+// runManaged supervises the HTTP server and both optional workers. A worker
+// ending unexpectedly (even with a nil error) is a service failure: cancel
+// the shared context, remove readiness and drain HTTP and remaining workers.
+func runManaged(ctx context.Context, ln net.Listener, srv *http.Server, readiness readinessState,
+	timeout time.Duration, logger *slog.Logger, tasks []backgroundTask) error {
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	exits := make(chan processExit, len(tasks)+1)
+	go func() { exits <- processExit{name: "HTTP", err: serve(runCtx, ln, srv, readiness, timeout, logger)} }()
+	for _, task := range tasks {
+		task := task
+		go func() { exits <- processExit{name: task.name, err: task.run(runCtx)} }()
+	}
+	first := <-exits
+	var problems []error
+	if ctx.Err() == nil {
+		if first.err == nil {
+			problems = append(problems, fmt.Errorf("%s stopped unexpectedly", first.name))
+		} else {
+			problems = append(problems, fmt.Errorf("%s failed: %w", first.name, first.err))
+		}
+	} else if first.err != nil {
+		problems = append(problems, fmt.Errorf("%s shutdown: %w", first.name, first.err))
+	}
+	readiness.MarkStopping()
+	stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for i := 0; i < len(tasks); i++ {
+		select {
+		case other := <-exits:
+			if other.err != nil && !errors.Is(other.err, context.Canceled) {
+				problems = append(problems, fmt.Errorf("%s: %w", other.name, other.err))
+			}
+		case <-deadline.C:
+			return errors.Join(append(problems, errors.New("background worker or HTTP shutdown exceeded timeout"))...)
+		}
+	}
+	return errors.Join(problems...)
 }
 
 type readinessState interface {
@@ -94,7 +181,6 @@ type readinessState interface {
 }
 
 func serve(ctx context.Context, ln net.Listener, srv *http.Server, readiness readinessState, timeout time.Duration, logger *slog.Logger) error {
-	// The listener already exists, but readiness remains false until Serve begins.
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 	readiness.MarkServing()
@@ -114,7 +200,6 @@ func serve(ctx context.Context, ln net.Listener, srv *http.Server, readiness rea
 		shutdownErr := srv.Shutdown(shutdownCtx)
 		if shutdownErr != nil {
 			logger.Warn("graceful HTTP drain failed", "error", shutdownErr)
-			// Force active connections closed after the grace period.
 			_ = srv.Close()
 		}
 		serveErr := <-errCh

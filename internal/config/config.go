@@ -14,22 +14,29 @@ import (
 
 // Config contains validated process configuration. DatabaseURL must never be logged.
 type Config struct {
-	HTTPAddr             string
-	DatabaseURL          string
-	DatabaseMaxConns     int32
-	LogLevel             slog.Level
-	StartupTimeout       time.Duration
-	ReadinessTimeout     time.Duration
-	ShutdownTimeout      time.Duration
-	OutboxEnabled        bool
-	KafkaBrokers         []string
-	MatchingTopic        string
-	OutboxBatchSize      int
-	OutboxPollInterval   time.Duration
-	OutboxLeaseTTL       time.Duration
-	OutboxPublishTimeout time.Duration
-	OutboxRetryBase      time.Duration
-	OutboxRetryMax       time.Duration
+	HTTPAddr               string
+	DatabaseURL            string
+	DatabaseMaxConns       int32
+	LogLevel               slog.Level
+	StartupTimeout         time.Duration
+	ReadinessTimeout       time.Duration
+	ShutdownTimeout        time.Duration
+	OutboxEnabled          bool
+	LifecycleEnabled       bool
+	ResultsTopic           string
+	LifecycleGroupID       string
+	LifecycleApplyTimeout  time.Duration
+	LifecycleCommitTimeout time.Duration
+	LifecycleRetryBase     time.Duration
+	LifecycleRetryMax      time.Duration
+	KafkaBrokers           []string
+	MatchingTopic          string
+	OutboxBatchSize        int
+	OutboxPollInterval     time.Duration
+	OutboxLeaseTTL         time.Duration
+	OutboxPublishTimeout   time.Duration
+	OutboxRetryBase        time.Duration
+	OutboxRetryMax         time.Duration
 }
 
 // Load obtains configuration exclusively from the environment.
@@ -87,6 +94,33 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, errors.New("ORDER_SERVICE_OUTBOX_ENABLED must be true or false")
 	}
 	cfg.OutboxEnabled = enabled
+	lifecycleEnabled, err := strconv.ParseBool(get("ORDER_SERVICE_LIFECYCLE_ENABLED", "false"))
+	if err != nil {
+		return Config{}, errors.New("ORDER_SERVICE_LIFECYCLE_ENABLED must be true or false")
+	}
+	cfg.LifecycleEnabled = lifecycleEnabled
+	cfg.ResultsTopic = get("ORDER_SERVICE_MATCHING_RESULTS_TOPIC", "matching.results.v1")
+	cfg.LifecycleGroupID = get("ORDER_SERVICE_LIFECYCLE_GROUP_ID", "meow-order-service-lifecycle-v1")
+	lifecycleDurations := []struct {
+		key      string
+		dest     *time.Duration
+		fallback string
+	}{
+		{"ORDER_SERVICE_LIFECYCLE_APPLY_TIMEOUT", &cfg.LifecycleApplyTimeout, "30s"},
+		{"ORDER_SERVICE_LIFECYCLE_COMMIT_TIMEOUT", &cfg.LifecycleCommitTimeout, "10s"},
+		{"ORDER_SERVICE_LIFECYCLE_RETRY_BASE", &cfg.LifecycleRetryBase, "500ms"},
+		{"ORDER_SERVICE_LIFECYCLE_RETRY_MAX", &cfg.LifecycleRetryMax, "30s"},
+	}
+	for _, d := range lifecycleDurations {
+		v, parseErr := time.ParseDuration(get(d.key, d.fallback))
+		if parseErr != nil || v < time.Millisecond || v > 5*time.Minute || v%time.Millisecond != 0 {
+			return Config{}, fmt.Errorf("%s must be 1ms..5m in whole milliseconds", d.key)
+		}
+		*d.dest = v
+	}
+	if cfg.LifecycleRetryMax < cfg.LifecycleRetryBase {
+		return Config{}, errors.New("lifecycle retry max must be >= retry base")
+	}
 	cfg.MatchingTopic = get("ORDER_SERVICE_MATCHING_TOPIC", "matching.commands.v1")
 	cfg.OutboxBatchSize, err = strconv.Atoi(get("ORDER_SERVICE_OUTBOX_BATCH_SIZE", "8"))
 	if err != nil || cfg.OutboxBatchSize < 1 || cfg.OutboxBatchSize > 100 {
@@ -115,18 +149,24 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 		cfg.OutboxPublishTimeout > time.Minute {
 		return Config{}, errors.New("invalid outbox lease/timeout/retry relationship")
 	}
-	if enabled {
+	if enabled || lifecycleEnabled {
 		brokers := get("ORDER_SERVICE_KAFKA_BROKERS", "")
 		for _, broker := range strings.Split(brokers, ",") {
 			host, port, splitErr := net.SplitHostPort(broker)
 			n, portErr := strconv.Atoi(port)
 			if splitErr != nil || strings.TrimSpace(broker) != broker || host == "" || portErr != nil || n < 1 || n > 65535 {
-				return Config{}, errors.New("ORDER_SERVICE_KAFKA_BROKERS must be comma-separated host:port entries when outbox is enabled")
+				return Config{}, errors.New("ORDER_SERVICE_KAFKA_BROKERS must be comma-separated host:port entries when a Kafka worker is enabled")
 			}
 			cfg.KafkaBrokers = append(cfg.KafkaBrokers, broker)
 		}
-		if !validKafkaTopic(cfg.MatchingTopic) {
+		if enabled && !validKafkaTopic(cfg.MatchingTopic) {
 			return Config{}, errors.New("ORDER_SERVICE_MATCHING_TOPIC must be a valid Kafka topic")
+		}
+		if lifecycleEnabled && (!validKafkaTopic(cfg.ResultsTopic) || !validKafkaTopic(cfg.LifecycleGroupID)) {
+			return Config{}, errors.New("matching results topic and lifecycle consumer group ID must be valid")
+		}
+		if lifecycleEnabled && cfg.ResultsTopic == cfg.MatchingTopic {
+			return Config{}, errors.New("matching result and command topics must be distinct")
 		}
 	}
 	if err := validateListenAddr(cfg.HTTPAddr); err != nil {

@@ -15,5 +15,37 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  kafka:
+    image: confluentinc/confluent-local:7.5.0
+    hostname: kafka
+    container_name: meow-kafka-dev
+    ports:
+      # For Go integration tests executed on the Docker host, not in a container.
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://127.0.0.1:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # Local single-node only; production replication/min-ISR must be higher.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # Local ephemeral cluster. Set KAFKA_LOCAL_CLUSTER_ID for a stable unique ID.
+      CLUSTER_ID: "${KAFKA_LOCAL_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}"
+    healthcheck:
+      # Tests broker API readiness, not merely an open TCP socket.
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 10s
+      retries: 25
+      start_period: 20s
+
 volumes:
   order_service_pgdata:
